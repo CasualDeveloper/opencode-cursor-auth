@@ -7,6 +7,7 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
 } from "../shared/constants.js";
+import { groupEffortFamilies } from "./effort-family.js";
 interface VariantDescriptor {
   key: string;
   idSuffixes: readonly string[];
@@ -14,6 +15,7 @@ interface VariantDescriptor {
 }
 
 const VARIANT_DESCRIPTORS: readonly VariantDescriptor[] = [
+  variantDescriptor("default", ["default"], ["Default"]),
   variantDescriptor("none", ["none"], ["None"]),
   variantDescriptor("low", ["low"], ["Low"]),
   variantDescriptor("medium", ["medium"], ["Medium"]),
@@ -27,15 +29,17 @@ const VARIANT_DESCRIPTORS: readonly VariantDescriptor[] = [
 ];
 
 const DEFAULT_VARIANT_ORDER = [
-  "medium",
+  "default",
   "none",
-  "high",
   "low",
+  "medium",
+  "high",
   "xhigh",
   "max",
 ] as const;
 
 const VARIANT_DISPLAY_ORDER = [
+  "default",
   "none",
   "low",
   "medium",
@@ -112,7 +116,10 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
       const parameters = parseParameterValues(variant.parameterValues);
       const values = new Map(parameters.map((parameter) => [parameter.id, parameter.value]));
       const context = values.get("context");
-      const rawEffort = values.get("reasoning") ?? values.get("effort");
+      const rawEffort =
+        values.get("reasoning") ??
+        values.get("effort") ??
+        values.get("reasoning-effort");
       const effort = normalizeEffort(rawEffort);
       if (rawEffort && !effort) continue;
       const structuralParts = buildStructuralParts(values, structuralParameters);
@@ -223,9 +230,9 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     }
   }
 
-  return [...output.values()]
-    .map((entry) => entry.model)
-    .sort((a, b) => a.id.localeCompare(b.id));
+  return groupEffortFamilies(
+    [...output.values()].map((entry) => entry.model),
+  );
 }
 
 function selectDefaultAvailableSelection(
@@ -293,7 +300,7 @@ function buildStructuralParameterMetadata(
   const metadata = new Map<string, ParameterMetadata>();
   for (const [index, definition] of definitions.entries()) {
     const id = stringProp(definition, "id");
-    if (!id || id === "reasoning" || id === "effort") continue;
+    if (!id || isEffortParameter(id)) continue;
     const values = parameterDefinitionValues(definition);
     metadata.set(id, {
       id,
@@ -311,7 +318,7 @@ function buildStructuralParameterMetadata(
 
   for (const variant of variants) {
     for (const parameter of parseParameterValues(variant.parameterValues)) {
-      if (parameter.id === "reasoning" || parameter.id === "effort") continue;
+      if (isEffortParameter(parameter.id)) continue;
       const existing = metadata.get(parameter.id);
       if (existing) {
         existing.baseline ??= parameter.value;
@@ -391,6 +398,10 @@ function structuralParameterSignature(
           : [parameter.id, "missing"],
     ),
   );
+}
+
+function isEffortParameter(id: string): boolean {
+  return id === "reasoning" || id === "effort" || id === "reasoning-effort";
 }
 
 function normalizeEffort(value: string | undefined): string | undefined {

@@ -24,7 +24,7 @@ function services(
 
 function context(events: unknown[] = []) {
   return {
-    catalog: { reload: async () => {} },
+    provider: { reload: async () => {} },
     event: {
       subscribe: ({ signal }: { signal: AbortSignal }) => ({
         async *[Symbol.asyncIterator]() {
@@ -100,10 +100,10 @@ describe("OpenCode V2 runtime lifecycle", () => {
       clearModelCache: () => {},
     }));
     const ctx = context([{
-      type: "integration.connection.updated",
-      data: { integrationID: "cursor" },
+      type: "credential.switched",
+      data: { integrationID: "cursor", credentialID: "cred_test" },
     }]);
-    ctx.catalog.reload = async () => { reloads += 1; };
+    ctx.provider.reload = async () => { reloads += 1; };
 
     const cleanup = await setup(ctx as never);
     for (let attempt = 0; attempt < 20 && discoveries < 2; attempt++) await Bun.sleep(5);
@@ -132,6 +132,39 @@ describe("OpenCode V2 runtime lifecycle", () => {
     expect(disposed).toEqual(["language", "integration"]);
   });
 
+  test("refreshes on Cursor sign-in and disconnect but ignores other credentials", async () => {
+    let connected = false;
+    let state: CursorCatalogState | undefined;
+    const inventories: string[][] = [];
+    const ctx = context([
+      { type: "credential.updated", data: {} },
+      { type: "credential.switched", data: { integrationID: "other", credentialID: "cred_other" } },
+      { type: "credential.switched", data: { integrationID: "cursor", credentialID: "cred_test" } },
+      { type: "credential.switched", data: { integrationID: "cursor", credentialID: null } },
+    ]);
+    ctx.provider.reload = async () => {
+      inventories.push(state!.models.map((item) => item.id));
+      connected = false;
+    };
+    const setup = createCursorRuntime(services({
+      resolveCredential: async () => connected ? ({ access: "token" }) as never : undefined,
+      getModels: async () => [model],
+      registerCatalog: async (_context, value) => {
+        state = value;
+        expect(state.models).toEqual([]);
+        connected = true;
+        return { dispose: async () => {} };
+      },
+    }));
+    const cleanup = await setup(ctx as never);
+    try {
+      for (let attempt = 0; attempt < 20 && inventories.length < 2; attempt++) await Bun.sleep(5);
+      expect(inventories).toEqual([[model.id], []]);
+    } finally {
+      await cleanup?.();
+    }
+  });
+
   test("continues handling connection events after a catalog reload failure", async () => {
     let reloads = 0;
     const setup = createCursorRuntime(services({
@@ -139,10 +172,10 @@ describe("OpenCode V2 runtime lifecycle", () => {
       getModels: async () => [model],
     }));
     const ctx = context([
-      { type: "integration.connection.updated", data: { integrationID: "cursor" } },
-      { type: "integration.connection.updated", data: { integrationID: "cursor" } },
+      { type: "credential.switched", data: { integrationID: "cursor", credentialID: "cred_test" } },
+      { type: "credential.switched", data: { integrationID: "cursor", credentialID: null } },
     ]);
-    ctx.catalog.reload = async () => {
+    ctx.provider.reload = async () => {
       reloads += 1;
       if (reloads === 1) throw new Error("temporary reload failure");
     };

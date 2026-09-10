@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin } from "@opencode/plugin";
 import { RefreshTokenInvalidError } from "../auth.js";
 import { clearModelCache, getCursorModels } from "../models.js";
 import { log } from "../shared/log.js";
@@ -85,9 +85,10 @@ export function createCursorRuntime(
       const getAccessToken =
         services.createAccessTokenProvider(context);
       services.startTransport();
-      cleanups.push(() => services.stopTransport());
+      const scope = crypto.randomUUID();
+      cleanups.push(() => services.stopTransport(scope));
       const languageRegistration =
-        await services.registerLanguage(context, getAccessToken);
+        await services.registerLanguage(context, getAccessToken, scope);
       cleanups.push(() => languageRegistration.dispose());
       const discoverModels = async (
         fallback: CursorCatalogState["models"],
@@ -139,7 +140,7 @@ export function createCursorRuntime(
             catalogState,
             models,
           );
-          await context.catalog.reload();
+          await context.provider.reload();
         })().finally(() => {
           reloadInFlight = undefined;
         });
@@ -153,7 +154,7 @@ export function createCursorRuntime(
             signal: controller.signal,
           })) {
             if (
-              event.type !== "integration.connection.updated" ||
+              event.type !== "credential.switched" ||
               event.data.integrationID !== CURSOR_INTEGRATION_ID
             ) {
               continue;
