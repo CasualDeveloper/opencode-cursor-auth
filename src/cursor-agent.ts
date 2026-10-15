@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
+import { create, fromBinary, toBinary, type Message } from "@bufbuild/protobuf";
+import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import * as p from "./proto/agent_pb.js";
 import { CURSOR_API_URL } from "./cursor-rpc.js";
 import { resolveNodeExecutable } from "./node-runtime.js";
@@ -30,6 +30,7 @@ import { readTurnUsage, type CursorTokenUsage } from "./cursor-agent-usage.js";
 
 export type CursorRunEvent =
   | { type: "text"; text: string }
+  | { type: "server-notice"; text: string }
   | { type: "reasoning"; text: string; id: string }
   | { type: "reasoning-metadata"; signatures: ReasoningSignature[] }
   | { type: "opaque-reasoning"; annotations: OpaqueReasoning[] }
@@ -139,6 +140,34 @@ export function runCursorAgent(
   return run.open(input.abortSignal);
 }
 
+// InteractionUpdate oneof fields absent from the base descriptor. SDK 1.4.1
+// adds thinking_note (28), voice_call_utterance (30), and model_call_completed
+// (31). The first two are UI events; per-call usage overlaps turnEnded totals.
+const NON_OUTPUT_UPDATES = new Set([19, 20, 21, 22, 23, 24, 26, 27, 28, 30, 31]);
+
+// SDK 1.0.37 InteractionQuery fields newer than this descriptor, mapped to
+// the reply's fail-closed result field and its string field 1. Web fetch
+// keeps the generic hosted-access reason.
+const NEWER_QUERIES = new Map<number, [result: number, reason?: string]>([
+  [9, [2]], // web fetch: rejected { reason }
+  [10, [2, "Cursor PR management is disabled."]], // error { error }
+  [11, [2, "Cursor MCP authentication is disabled."]], // rejected { reason }
+  [12, [2, "Cursor image generation is disabled."]], // rejected { reason }
+  [13, [2, "Cursor environment replacement is disabled."]], // failure { error_message }
+  [14, [2, "Cursor source-control connections are disabled."]], // rejected { reason }
+]);
+
+function hasWireFlag(message: Message, no: number): boolean {
+  return (
+    message.$unknown?.some(
+      (field) =>
+        field.no === no &&
+        field.wireType === WireType.Varint &&
+        new BinaryReader(field.data).bool(),
+    ) ?? false
+  );
+}
+
 function extractToolOutput(raw: string): string {
   try {
     const parsed = JSON.parse(raw);
@@ -175,6 +204,7 @@ class AgentRun {
   private sawTokenDelta = false;
   private checkpointSeenThisStep = false;
   private checkpointAfterTokenDelta = false;
+  private checkpointAfterTurnEnded = false;
   private traceCount = 0;
   private outputStarted = false;
   private resumed = false;
@@ -234,6 +264,10 @@ class AgentRun {
       },
       onEnd: (error) => {
         if (this.status === "closed") return;
+        if (error?.message.startsWith("Cursor transport: premature-eof"))
+          error = new Error(
+            `${error.message} (turnEnded=${this.turnEnded}, finalCheckpoint=${this.checkpointAfterTurnEnded})`,
+          );
         if (error || !this.turnEnded)
           return this.dispose(
             error ?? new Error("Cursor Run ended without turnEnded"),
@@ -466,7 +500,7 @@ class AgentRun {
         this.reasoningBlocks.set(event.id, content);
         appendEntry(this.expected, { role: "assistant", content: [content] });
       }
-    } else
+    } else if (event.type === "text")
       appendEntry(this.expected, {
         role: "assistant",
         content: [
@@ -636,18 +670,14 @@ class AgentRun {
     });
   }
 
-  // Cursor applies a native StrReplace to its materializing read as raw file
-  // bytes, but host reads are formatted for the model. Its read and write are
-  // declined so the model edits through the host edit tool.
-  private declineNativeEdit(
+  private declineNativeFileOperation(
     exec: p.ExecServerMessage,
     action: Extract<
       p.ExecServerMessage["message"],
       { case: "readArgs" | "writeArgs" }
     >,
+    reason: string,
   ) {
-    const reason =
-      "Cursor's built-in edit is unavailable here; use the host edit tool.";
     this.send({
       case: "execClientMessage",
       value: create(p.ExecClientMessageSchema, {
@@ -767,31 +797,31 @@ class AgentRun {
           }),
         }),
       };
-    else if (
-      q.case === undefined &&
-      query.$unknown?.some((field) => field.no === 9)
-    )
-      // Web fetch (field 9) postdates this descriptor. Its response has the
-      // other gates' layout: rejected = 2 { reason = 1 }.
+    else if (q.case === undefined) {
+      // Queries newer than this descriptor. Each reply mirrors the query
+      // field and fails closed as SDK 1.0.37 local runs do.
+      const field = query.$unknown?.find((item) => NEWER_QUERIES.has(item.no));
+      if (!field) throw new Error("Unsupported Cursor interaction");
+      const [result, reason] = NEWER_QUERIES.get(field.no)!;
       response.$unknown = [
         {
-          no: 9,
+          no: field.no,
           wireType: WireType.LengthDelimited,
           data: new BinaryWriter()
             .bytes(
               new BinaryWriter()
-                .tag(2, WireType.LengthDelimited)
+                .tag(result, WireType.LengthDelimited)
                 .fork()
                 .tag(1, WireType.LengthDelimited)
-                .string(hosted)
+                .string(reason ?? hosted)
                 .join()
                 .finish(),
             )
             .finish(),
         },
       ];
-    // A VM setup result can only claim success, and other queries have no
-    // known reply layout.
+    }
+    // A VM setup result can only claim success.
     else throw new Error("Unsupported Cursor interaction");
     this.send({ case: "interactionResponse", value: response });
   }
@@ -1239,6 +1269,13 @@ class AgentRun {
   private receive(message: p.AgentServerMessage) {
     if (this.status === "closed") return;
     const item = message.message;
+    // SDK 1.0.37: AgentServerMessage.ttft_breakdown = 8 is latency telemetry.
+    if (
+      item.case === undefined &&
+      message.$unknown?.length &&
+      message.$unknown.every((field) => field.no === 8)
+    )
+      return;
     if (item.case === "interactionUpdate") {
       const update = item.value.message;
       if (
@@ -1255,13 +1292,14 @@ class AgentRun {
           result: record(result)?.case ?? "none",
         });
       }
-      // SDK 1.0.31: field 21 is a feedback-form notification; 25 is an
-      // optional timestamp. Neither is model output or an execution request.
-      // The base AgentService descriptor retains these as unknown fields.
       if (
         update.case === undefined &&
-        item.value.$unknown?.some((field) => field.no === 21) &&
-        item.value.$unknown.every((field) => field.no === 21 || field.no === 25)
+        item.value.$unknown?.length &&
+        item.value.$unknown.every(({ no, wireType }) =>
+          no === 25 // optional message_started_at_ms
+            ? wireType === WireType.Varint
+            : wireType === WireType.LengthDelimited && NON_OUTPUT_UPDATES.has(no),
+        )
       )
         return;
       if (this.turnEnded && update.case !== "heartbeat")
@@ -1270,7 +1308,9 @@ class AgentRun {
         if (update.value.text)
           this.emit(
             update.case === "textDelta"
-              ? { type: "text", text: update.value.text }
+              ? hasWireFlag(update.value, 2) // TextDeltaUpdate.is_server_notice
+                ? { type: "server-notice", text: update.value.text }
+                : { type: "text", text: update.value.text }
               : {
                   type: "reasoning",
                   text: update.value.text,
@@ -1320,6 +1360,7 @@ class AgentRun {
       return;
     }
     if (item.case === "conversationCheckpointUpdate") {
+      if (this.turnEnded) this.checkpointAfterTurnEnded = true;
       // A checkpoint without token details must not erase known occupancy.
       if (item.value.tokenDetails?.usedTokens) {
         this.contextTokens = item.value.tokenDetails.usedTokens;
@@ -1455,11 +1496,29 @@ class AgentRun {
       }
       if (!action.case)
         return this.rejectExec(exec, "Unknown exec message variant");
+      // SDK 1.4.1: OpenCode's plain write cannot enforce Cursor's plan mode,
+      // workspace confinement, or check against Cursor's last view of a file.
+      if (
+        action.case === "writeArgs" &&
+        (hasWireFlag(action.value, 7) ||
+          hasWireFlag(action.value, 8) ||
+          hasWireFlag(exec, 59))
+      )
+        return this.declineNativeFileOperation(
+          exec,
+          action,
+          "The host cannot enforce the requested write restrictions.",
+        );
+      // Cursor applies a native StrReplace to raw bytes; host reads are formatted.
       if (
         (action.case === "readArgs" || action.case === "writeArgs") &&
         this.nativeEdits.has(action.value.toolCallId)
       )
-        return this.declineNativeEdit(exec, action);
+        return this.declineNativeFileOperation(
+          exec,
+          action,
+          "Cursor's built-in edit is unavailable here; use the host edit tool.",
+        );
 
       let name: string | undefined;
       let input: string;

@@ -14,11 +14,45 @@ import {
 } from "../src/shared/constants";
 
 describe("Cursor model normalization", () => {
+  test("publishes the live context for each selectable mode, including models without a context parameter", () => {
+    const models = normalizeAvailableModels([
+      { name: "gemini", contextTokenLimit: 1_000_000, variants: [{ legacySlug: "gemini-high" }] },
+      { name: "regular", contextTokenLimit: 256_000, contextTokenLimitForMaxMode: 500_000 },
+      { name: "max-only", supportsMaxMode: true, contextTokenLimit: 256_000, contextTokenLimitForMaxMode: 500_000 },
+      {
+        name: "both", contextTokenLimit: 200_000, contextTokenLimitForMaxMode: 1_000_000,
+        variants: [{ legacySlug: "both", isMaxMode: true }, { legacySlug: "both" }],
+      },
+    ]);
+    expect(models.map(m => [m.id, m.contextWindow, m.defaultSelection.maxMode])).toEqual([
+      ["both", 200_000, false], ["both-1m", 1_000_000, true], ["gemini", 1_000_000, false],
+      ["max-only", 500_000, true], ["regular", 256_000, false],
+    ]);
+    // Both modes use the same wire slug; a stale header must not send the
+    // short-context mode when OpenCode is budgeting for the 1M entry.
+    expect(selectionForCursorRequest(models, "both-1m",
+      encodeCursorModelSelection(models[0]!.defaultSelection)).maxMode).toBe(true);
+  });
+
+  test("an explicit default-sized window beats a larger Cursor reference; unknown limits still use it", () => {
+    const defaults = { context: DEFAULT_CONTEXT_WINDOW, output: DEFAULT_MAX_TOKENS };
+    for (const [field, expected] of [
+      [DEFAULT_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW],
+      [undefined, 1_000_000], [0, 1_000_000], [-42, 1_000_000], [Infinity, 1_000_000],
+    ] as const) {
+      const [model] = normalizeAvailableModels([{ name: "example", contextTokenLimit: field }]);
+      const limits = applyCatalogMetadata(model!, [{ providerID: "cursor", id: "example", context: 1_000_000 }], defaults);
+      expect(limits.context).toBe(expected);
+    }
+  });
+
   test("uses explicit AvailableModels context variants", () => {
     const models = normalizeAvailableModels([{
       name: "composer-2",
       clientDisplayName: "Composer 2",
       serverModelName: "composer-2",
+      contextTokenLimit: 128_000,
+      contextTokenLimitForMaxMode: 1_000_000,
       parameterDefinitions: [
         {
           id: "context",
@@ -62,6 +96,7 @@ describe("Cursor model normalization", () => {
             { id: "reasoning", value: "medium" },
           ],
           legacySlug: "composer-2-1m-medium",
+          isMaxMode: true,
           isDefaultMaxConfig: true,
         },
       ],
@@ -72,6 +107,39 @@ describe("Cursor model normalization", () => {
       ["composer-2-1m", 1_000_000],
     ]);
     expect(models[0]?.variants).toHaveProperty("high");
+  });
+
+  test("flat models expose a distinct supported Max window; parameterized models only expose returned modes", () => {
+    const flat = { name: "model", supportsNonMaxMode: true, supportsMaxMode: true,
+      contextTokenLimit: 256_000, contextTokenLimitForMaxMode: 500_000 };
+    expect(normalizeAvailableModels([flat]).map(m => [m.id, m.contextWindow, m.defaultSelection.maxMode]))
+      .toEqual([["model", 256_000, false], ["model-500k", 500_000, true]]);
+    const limited = normalizeAvailableModels([{ ...flat, variants: [
+      { parameterValues: [{ id: "context", value: "256k" }], isDefaultMaxConfig: true },
+    ] }]);
+    expect(limited.map(m => [m.id, m.contextWindow, m.defaultSelection.maxMode]))
+      .toEqual([["model", 256_000, false]]);
+  });
+
+  test("keeps effort aliases with different live windows separately selectable", () => {
+    const models = publishCursorCatalog([
+      { name: "sample-low", contextTokenLimit: 128_000 },
+      { name: "sample-high", contextTokenLimit: 1_000_000 },
+    ], []);
+    expect(models.map(m => [m.id, m.contextWindow])).toEqual([
+      ["sample-high", 1_000_000], ["sample-low", 128_000],
+    ]);
+  });
+
+  test("a usable-only effort stays selectable without inheriting an unverified 1M window", () => {
+    const models = publishCursorCatalog([
+      { name: "sample", contextTokenLimit: 1_000_000, variants: [{
+        legacySlug: "sample-low", parameterValues: [{ id: "effort", value: "low" }],
+      }] },
+    ], [{ modelId: "sample-low" }, { modelId: "sample-high" }]);
+    expect(models.map(m => [m.id, m.contextWindow, Object.keys(m.variants)])).toEqual([
+      ["sample", 1_000_000, ["low"]], ["sample-high", DEFAULT_CONTEXT_WINDOW, []],
+    ]);
   });
 
   test("groups live Cursor parameter spellings without splitting the family", () => {
@@ -289,6 +357,37 @@ describe("Cursor model normalization", () => {
     expect(models[0]?.defaultSelection.publicId).toBe("gemini-3.7-flash");
   });
 
+  test("drops a usable family that aliases an AvailableModels family under another id", () => {
+    const models = publishCursorCatalog(
+      [{
+        name: "claude-opus-9",
+        clientDisplayName: "Claude Opus 9",
+        serverModelName: "claude-opus-9",
+        parameterDefinitions: [{
+          id: "effort",
+          parameterType: {
+            enumParameter: { values: [{ value: "high" }, { value: "max" }] },
+          },
+        }],
+        variants: ["high", "max"].map((effort) => ({
+          parameterValues: [{ id: "effort", value: effort }],
+          legacySlug: `claude-9-opus-${effort}-thinking`,
+        })),
+      }],
+      [
+        { modelId: "claude-9-opus-high", displayName: "Claude Opus 9 Legacy" },
+        { modelId: "claude-9-opus-high-thinking", displayName: "Claude Opus 9 Legacy" },
+        { modelId: "claude-9-opus-max-thinking", displayName: "Claude Opus 9 Legacy" },
+        { modelId: "claude-fable-5.1", displayName: "Claude Fable 5.1" },
+      ],
+    );
+
+    expect(models.map((model) => model.id)).toEqual([
+      "claude-fable-5.1",
+      "claude-opus-9",
+    ]);
+  });
+
   test("keeps grok-4.6 stable and sends the usable wire id", () => {
     const models = publishCursorCatalog(
       [
@@ -359,7 +458,7 @@ describe("Cursor model normalization", () => {
 
   test("uses the models.dev Cursor row, not the lab row, for host limits", () => {
     const applied = applyCatalogMetadata(
-      { id: "grok-4.6", contextWindow: 200_000, maxTokens: 64_000 },
+      { id: "grok-4.6", contextWindow: 200_000, contextWindowIsFallback: true, maxTokens: 64_000 },
       [
         {
           providerID: "xai",

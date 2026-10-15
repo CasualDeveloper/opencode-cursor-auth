@@ -3,7 +3,7 @@ import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { gzipSync } from "node:zlib";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { BinaryReader, WireType } from "@bufbuild/protobuf/wire";
+import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import type {
   LanguageModelV3CallOptions,
   LanguageModelV3StreamPart,
@@ -726,6 +726,7 @@ test("transmits an explicit empty tool allowlist and handles compressed frames",
     Object.hasOwn(backend.requests[0]!, "x-cursor-agent-allowed-tools"),
   ).toBe(true);
   expect(backend.requests[0]!["x-cursor-agent-allowed-tools"]).toBe("");
+  expect(backend.requests[0]!["connect-accept-encoding"]).toBe("gzip");
 });
 
 test("offers Cursor only its MCP tool family when host tools are available", async () => {
@@ -788,34 +789,44 @@ test("drains final checkpoint/blob work after turnEnded before accepting Connect
   expect(result.providerMetadata?.cursor?.contextTokens).toBe(321);
 });
 
-test("ignores a post-turn feedback form but still rejects unknown terminal updates", async () => {
-  for (const field of [21, 22]) {
+test.each([21, 24, 28, 30, 31, 99])(
+  "classifies post-turn InteractionUpdate field %i without appending it to the answer",
+  async (field) => {
     const backend = await peer((message, stream) => {
       if (message.case !== "runRequest") return;
+      stream.write(text("answer"));
       stream.write(end());
+      const payload = new BinaryWriter();
+      if (field === 28 || field === 30 || field === 31)
+        payload.tag(field === 30 ? 3 : 1, WireType.LengthDelimited).string("side channel");
       stream.write(
         frame(
           encoded({
             case: "interactionUpdate",
             value: fromBinary(
               p.InteractionUpdateSchema,
-              new Uint8Array([(((field << 3) | 2) & 127) | 128, 1, 0]),
+              new BinaryWriter()
+                .tag(field, WireType.LengthDelimited).bytes(payload.finish())
+                .tag(25, WireType.Varint).uint64(123).finish(),
             ),
           }),
         ),
       );
+      // SDK 1.0.37 latency telemetry, AgentServerMessage field 8.
+      stream.write(frame(Uint8Array.of((8 << 3) | 2, 0)));
       stream.end(close());
     });
-    if (field === 21)
-      expect(
-        (await model(backend.url).doGenerate({ prompt })).finishReason.unified,
-      ).toBe("stop");
-    else
+    if (field === 99) {
       await expect(model(backend.url).doGenerate({ prompt })).rejects.toThrow(
         "output after turnEnded",
       );
-  }
-});
+    } else {
+      const result = await model(backend.url).doGenerate({ prompt });
+      expect(result.finishReason.unified).toBe("stop");
+      expect(result.content).toEqual([{ type: "text", text: "answer" }]);
+    }
+  },
+);
 
 test("doGenerate persists late signature metadata only from a referenced assistant root", async () => {
   let acknowledgements = 0;
@@ -1690,6 +1701,36 @@ test("a matching final checkpoint uses Cursor input when output deltas omit gene
   expect(result.providerMetadata?.cursor?.turnUsage).toMatchObject({ input: 90, output: 13 });
 });
 
+test("Cursor server notices become a warning and metadata, never assistant text", async () => {
+  const notice = "Switched to a fallback model after a safety filter.";
+  const flagged = create(p.TextDeltaUpdateSchema, { text: `\n\n${notice}` });
+  flagged.$unknown = [
+    { no: 2, wireType: WireType.Varint, data: Uint8Array.of(1) },
+  ];
+  const backend = await peer((message, stream) => {
+    if (message.case !== "runRequest") return;
+    stream.write(text("answer"));
+    stream.write(
+      frame(
+        encoded({
+          case: "interactionUpdate",
+          value: create(p.InteractionUpdateSchema, {
+            message: { case: "textDelta", value: flagged },
+          }),
+        }),
+      ),
+    );
+    stream.write(end());
+    stream.end(close());
+  });
+  const result = await model(backend.url).doGenerate({ prompt });
+  expect(result.content).toEqual([
+    { type: "text", text: "answer", providerMetadata: undefined },
+  ]);
+  expect(result.warnings).toEqual([{ type: "other", message: notice }]);
+  expect(result.providerMetadata?.cursor?.serverNotice).toBe(notice);
+});
+
 test("usage preserves explicit zeros and unknown fields, and rejects unsafe counters", () => {
   const decode = (
     input: Parameters<typeof create<typeof TurnUsageSchema>>[1],
@@ -1873,14 +1914,18 @@ test("declines Cursor-hosted interaction queries so the Run continues with host 
           value: create(p.CreatePlanRequestQuerySchema),
         }),
       );
-      const webFetch = create(p.InteractionQuerySchema, { id: 7 });
-      webFetch.$unknown = [
-        { no: 9, wireType: WireType.LengthDelimited, data: Uint8Array.of(0) },
-      ];
-      stream.write(frame(encoded({ case: "interactionQuery", value: webFetch })));
+      // SDK 1.0.37 queries newer than the descriptor: web fetch, PR
+      // management, MCP auth, image generation, env replacement, SCM.
+      for (const no of [9, 10, 11, 12, 13, 14]) {
+        const newer = create(p.InteractionQuerySchema, { id: no - 2 });
+        newer.$unknown = [
+          { no, wireType: WireType.LengthDelimited, data: Uint8Array.of(0) },
+        ];
+        stream.write(frame(encoded({ case: "interactionQuery", value: newer })));
+      }
     } else if (message.case === "interactionResponse") {
       answers.set(message.value.id, message.value);
-      if (answers.size === 7) {
+      if (answers.size === 12) {
         stream.write(text("continued"));
         stream.write(end());
         stream.end(close());
@@ -1902,16 +1947,59 @@ test("declines Cursor-hosted interaction queries so the Run continues with host 
     ["switchModeRequestResponse", "rejected"],
     ["createPlanRequestResponse", "error"],
   ]);
-  const webFetch = answers.get(7)!;
-  expect(webFetch.result.case).toBeUndefined();
-  const field = webFetch.$unknown?.find((item) => item.no === 9);
-  expect(field?.wireType).toBe(WireType.LengthDelimited);
-  const response = new BinaryReader(new BinaryReader(field!.data).bytes());
-  expect(response.tag()).toEqual([2, WireType.LengthDelimited]);
-  const rejected = new BinaryReader(response.bytes());
-  expect(rejected.tag()).toEqual([1, WireType.LengthDelimited]);
-  expect(rejected.string()).toContain("host tool");
+  for (const no of [9, 10, 11, 12, 13, 14]) {
+    const answer = answers.get(no - 2)!;
+    expect(answer.result.case).toBeUndefined();
+    const field = answer.$unknown?.find((item) => item.no === no);
+    expect(field?.wireType).toBe(WireType.LengthDelimited);
+    const response = new BinaryReader(new BinaryReader(field!.data).bytes());
+    expect(response.tag()).toEqual([2, WireType.LengthDelimited]);
+    const declined = new BinaryReader(response.bytes());
+    expect(declined.tag()).toEqual([1, WireType.LengthDelimited]);
+    expect(declined.string()).toMatch(no === 9 ? /host tool/ : /disabled/);
+  }
 });
+
+test.each(["plan_mode", "confine_to_workspace", "refuse_unread_changes", "unrestricted"])(
+  "honors SDK 1.4.1 native write constraints: %s",
+  async (mode) => {
+    process.env.OPENCODE_CURSOR_NATIVE_TOOL_SETTLE_MS = "20";
+    const backend = await peer((message, stream) => {
+      if (message.case === "runRequest") {
+        const args = create(p.WriteArgsSchema, {
+          path: "note.txt", fileText: "note", toolCallId: "native-write",
+        });
+        const exec = create(p.ExecServerMessageSchema, {
+          id: 1, execId: "write-1", message: { case: "writeArgs", value: args },
+        });
+        const flag = (enabled: boolean) => ({
+          wireType: WireType.Varint, data: Uint8Array.of(enabled ? 1 : 0),
+        });
+        args.$unknown = [
+          { no: 7, ...flag(mode === "plan_mode") },
+          { no: 8, ...flag(mode === "confine_to_workspace") },
+        ];
+        exec.$unknown = [{ no: 59, ...flag(mode === "refuse_unread_changes") }];
+        stream.write(frame(encoded({ case: "execServerMessage", value: exec })));
+      } else if (message.case === "execClientMessage") {
+        const reply = message.value.message;
+        if (reply.case === "writeResult" && reply.value.result.case === "rejected") {
+          stream.write(text("write declined"));
+          stream.write(end());
+          stream.end(close());
+        }
+      }
+    });
+    const result = await model(backend.url).doGenerate({
+      prompt, tools: [{ type: "function", name: "write", inputSchema: { type: "object" } }],
+    });
+    if (mode === "unrestricted") {
+      expect(result.content).toMatchObject([{ type: "tool-call", toolName: "write" }]);
+    } else {
+      expect(result.content).toEqual([{ type: "text", text: "write declined" }]);
+    }
+  },
+);
 
 test("declines Cursor's native edit so formatted host reads are never written back", async () => {
   process.env.OPENCODE_CURSOR_NATIVE_TOOL_SETTLE_MS = "20";

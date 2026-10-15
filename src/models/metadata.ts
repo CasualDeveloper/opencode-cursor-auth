@@ -34,7 +34,7 @@ const CURSOR_PROVIDER_ID = "cursor";
  * Availability still comes from the live Cursor catalog.
  */
 export function applyCatalogMetadata(
-  model: { id: string; contextWindow: number; maxTokens: number },
+  model: { id: string; contextWindow: number; contextWindowIsFallback?: true; maxTokens: number },
   references: readonly CatalogMetadata[],
   defaults: { context: number; output: number },
 ): AppliedCatalogMetadata {
@@ -47,13 +47,12 @@ export function applyCatalogMetadata(
       reference.providerID !== CURSOR_PROVIDER_ID &&
       (reference.id === model.id || reference.id.endsWith(`/${model.id}`)),
   );
-  const unspecified =
-    model.contextWindow === defaults.context &&
-    model.maxTokens === defaults.output;
+  const referenceContext = cursor?.context;
   return {
     family: cursor?.family ?? lab?.family,
-    context: unspecified && cursor?.context ? cursor.context : model.contextWindow,
-    output: unspecified && cursor?.output ? cursor.output : model.maxTokens,
+    context: model.contextWindowIsFallback && referenceContext !== undefined &&
+      Number.isSafeInteger(referenceContext) && referenceContext > 0 ? referenceContext : model.contextWindow,
+    output: model.maxTokens === defaults.output && cursor?.output ? cursor.output : model.maxTokens,
     input: cursor?.input?.length
       ? mediaInputs(cursor.input)
       : ["text", "image"],

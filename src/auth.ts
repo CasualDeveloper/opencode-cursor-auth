@@ -61,7 +61,10 @@ export async function tryPollCursorAuth(
 ): Promise<{ accessToken: string; refreshToken: string } | null> {
   const response = await fetch(
     `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
-    { signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS) },
+    {
+      headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
+    },
   );
 
   if (response.status === 404) {
@@ -69,10 +72,22 @@ export async function tryPollCursorAuth(
   }
 
   if (response.ok) {
-    const data = (await response.json()) as {
-      accessToken: string;
-      refreshToken: string;
-    };
+    // Parse errors can contain fragments of the response, including tokens.
+    const data: unknown = await response.json().catch(() => null);
+    if (
+      !data ||
+      typeof data !== "object" ||
+      !("accessToken" in data) ||
+      typeof data.accessToken !== "string" ||
+      !data.accessToken.trim() ||
+      !("refreshToken" in data) ||
+      typeof data.refreshToken !== "string" ||
+      !data.refreshToken.trim()
+    ) {
+      throw new Error(
+        `Cursor login poll returned HTTP ${response.status} without a Cursor access and refresh token pair`,
+      );
+    }
     return {
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,

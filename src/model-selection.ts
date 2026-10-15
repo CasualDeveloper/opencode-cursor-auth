@@ -20,6 +20,8 @@ export interface CursorModel {
   name: string;
   reasoning: boolean;
   contextWindow: number;
+  /** No live context limit was advertised for this selection. */
+  contextWindowIsFallback?: true;
   maxTokens: number;
   defaultSelection: CursorModelSelection;
   variants: Record<string, CursorModelSelection>;
@@ -38,8 +40,15 @@ export function selectionForCursorRequest(
   );
   if (!header) return resolved ?? literalCursorModelSelection(modelId);
   if (!resolved) return header;
-  if (knownWire(models, modelId, header.publicId)) return header;
-  return resolved;
+  const model = findCursorModel(models, modelId);
+  // Different context windows can share a legacy slug and reasoning effort.
+  return (model && selections(model).find((candidate) =>
+    candidate.publicId === header.publicId &&
+    candidate.modelId === header.modelId &&
+    candidate.maxMode === header.maxMode &&
+    candidate.parameters.length === header.parameters.length &&
+    candidate.parameters.every(p => header.parameters.some(h => h.id === p.id && h.value === p.value)),
+  )) ?? resolved;
 }
 
 function effortKey(selection: CursorModelSelection | undefined): string | undefined {
@@ -58,16 +67,6 @@ function effortKey(selection: CursorModelSelection | undefined): string | undefi
     return "xhigh";
   }
   return value;
-}
-
-function knownWire(
-  models: readonly CursorModel[],
-  modelId: string,
-  publicId: string,
-): boolean {
-  const model = findCursorModel(models, modelId);
-  if (!model) return false;
-  return selections(model).some((selection) => selection.publicId === publicId);
 }
 
 export function resolveCursorModelSelection(

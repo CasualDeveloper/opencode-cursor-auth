@@ -199,8 +199,11 @@ Optional AgentService controls:
 - One Cursor integration currently resolves one active OpenCode credential.
 - Real account acceptance consumes Cursor quota and is run separately from
   deterministic CI.
-- Models without explicit Cursor context metadata use the configurable default
-  context and output limits listed above.
+- Context windows follow the selected Cursor model and mode. Pick the `1M`
+  entry when Cursor offers it; selecting a reasoning effort alone does not
+  enable long context. If Cursor supplies no window (as for some Auto routes),
+  the adapter uses a matching Cursor provider reference or
+  `OPENCODE_CURSOR_DEFAULT_CONTEXT_WINDOW` (200,000 by default).
 - The plugin relies on Cursor's private API, which can change without notice.
 - The replacement has offline host acceptance and live Composer/Auto/Opus,
   signed-reasoning restart, 452k mixed-history, and billing-comparison evidence.

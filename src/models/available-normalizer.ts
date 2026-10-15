@@ -72,7 +72,8 @@ interface AvailableSelection {
 interface AvailableGroup {
   id: string;
   name: string;
-  contextWindow: number;
+  structuralKey: string;
+  contextWindow?: number;
   selections: AvailableSelection[];
 }
 
@@ -109,16 +110,31 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     const variants = arrayProp(model, "variants")
       .map(asRecord)
       .filter((value): value is Record<string, unknown> => Boolean(value));
+    const regularLimit = tokenCount(model.contextTokenLimit);
+    const maxLimit = tokenCount(model.contextTokenLimitForMaxMode);
+    const maxOnly = model.supportsMaxMode === true && model.supportsNonMaxMode !== true;
+    // With a parameterized catalog only the returned combinations are selectable.
+    // A flat catalog instead declares its supported modes on the model.
+    if (!variants.length && model.supportsNonMaxMode === true && model.supportsMaxMode === true &&
+        maxLimit !== undefined && maxLimit !== regularLimit) {
+      variants.push({ isMaxMode: false }, { isMaxMode: true });
+    }
     const structuralParameters = buildStructuralParameterMetadata(
       definitions,
       variants,
     );
 
     const groups = new Map<string, AvailableGroup>();
+    const regularGroups = new Set<string>();
+    const baselineContext = structuralParameters.find(p => p.id === "context" && p.declared)?.baseline;
     for (const variant of variants) {
       const parameters = parseParameterValues(variant.parameterValues);
       const values = new Map(parameters.map((parameter) => [parameter.id, parameter.value]));
-      const context = values.get("context");
+      const maxMode = variant.isMaxMode === true || (variant.isMaxMode === undefined && maxOnly);
+      const context = parseTokenLimit(values.get("context") ?? baselineContext);
+      const modeLimit = maxMode ? maxLimit : regularLimit;
+      const limit = context !== undefined && modeLimit !== undefined
+        ? Math.min(context, modeLimit) : context ?? modeLimit;
       const rawEffort =
         values.get("reasoning") ??
         values.get("effort") ??
@@ -129,10 +145,9 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
       const structuralParts = buildStructuralParts(values, structuralParameters);
       const suffixes = structuralParts.map((part) => part.id);
       const groupId = [name, ...suffixes].join("-");
-      const groupKey = structuralParameterSignature(
-        values,
-        structuralParameters,
-      );
+      const structuralKey = structuralParameterSignature(values, structuralParameters);
+      const groupKey = JSON.stringify([structuralKey, limit]);
+      if (!maxMode) regularGroups.add(structuralKey);
       const groupName = [
         displayName,
         ...structuralParts.map((part) => part.name),
@@ -145,12 +160,13 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
         modelId: serverModelName,
         displayName: groupName,
         parameters,
-        maxMode: variant.isMaxMode === true,
+        maxMode,
       };
       const group = groups.get(groupKey) ?? {
         id: groupId,
         name: groupName,
-        contextWindow: parseTokenLimit(context) ?? DEFAULT_CONTEXT_WINDOW,
+        structuralKey,
+        contextWindow: limit,
         selections: [],
       };
       group.selections.push({
@@ -169,14 +185,15 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
         modelId: serverModelName,
         displayName,
         parameters: [],
-        maxMode:
-          model.supportsMaxMode === true && model.supportsNonMaxMode !== true,
+        maxMode: maxOnly,
       };
+      const limit = maxOnly ? maxLimit : regularLimit;
       const candidate: CursorModel = {
         id: name,
         name: displayName,
         reasoning: model.supportsThinking === true,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
+        contextWindow: limit ?? DEFAULT_CONTEXT_WINDOW,
+        ...(limit === undefined && { contextWindowIsFallback: true }),
         maxTokens: DEFAULT_MAX_TOKENS,
         defaultSelection: flatSelection,
         variants: {},
@@ -189,6 +206,17 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     }
 
     for (const group of groups.values()) {
+      // When Cursor supplies the window only through the mode, there is no
+      // context parameter in the picker ID to distinguish these two routes.
+      if (regularGroups.has(group.structuralKey) && group.selections.every(e => e.selection.maxMode)) {
+        const size = group.contextWindow;
+        const label = size === undefined ? "Max Mode"
+          : size % 1_000_000 === 0 ? `${size / 1_000_000}M`
+          : size % 1_000 === 0 ? `${size / 1_000}K` : String(size);
+        group.id += `-${normalizeIdPart(label)}`;
+        group.name += ` ${label}`;
+        for (const entry of group.selections) entry.selection.displayName = group.name;
+      }
       const variantsByEffort = variantsForGroup(group.selections);
       const defaultEntry =
         group.selections.find((entry) => entry.isDefault) ??
@@ -210,7 +238,8 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
         id: publicId,
         name: group.name,
         reasoning: Object.keys(variantsByEffort).length > 0,
-        contextWindow: group.contextWindow,
+        contextWindow: group.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+        ...(group.contextWindow === undefined && { contextWindowIsFallback: true }),
         maxTokens: DEFAULT_MAX_TOKENS,
         defaultSelection: defaultEntry.selection,
         variants: variantsByEffort,
@@ -501,7 +530,11 @@ function parseTokenLimit(value: string | undefined): number | undefined {
   const amount = Number(match[1]);
   if (!Number.isFinite(amount) || amount <= 0) return undefined;
   const multiplier = match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
-  return Math.round(amount * multiplier);
+  return tokenCount(amount * multiplier);
+}
+
+function tokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

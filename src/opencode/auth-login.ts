@@ -24,6 +24,7 @@ export type CursorBrowserLoginResult = {
 
 type CursorLoginSession = PendingCursorLogin & {
   timer: ReturnType<typeof setTimeout> | undefined;
+  lastPoll?: string;
   resolve: (value: CursorBrowserLoginResult) => void;
   reject: (reason: Error) => void;
 };
@@ -76,7 +77,9 @@ async function runPollTick(session: CursorLoginSession): Promise<void> {
   if (current !== session || session.completed) return;
 
   if (Date.now() - session.startedAt > POLL_MAX_MS) {
-    const error = new Error("Cursor authentication polling timeout");
+    const error = new Error(
+      `Cursor authentication polling timeout (last poll: ${session.lastPoll ?? "no response"})`,
+    );
     log.error(`[opencode-cursor] Browser login failed: ${error.message}`);
     failSession(session, error);
     return;
@@ -88,6 +91,7 @@ async function runPollTick(session: CursorLoginSession): Promise<void> {
       session.verifier,
     );
     if (!tokens) {
+      session.lastPoll = "HTTP 404, no credential available";
       schedulePoll(session, POLL_INTERVAL_MS);
       return;
     }
@@ -102,7 +106,9 @@ async function runPollTick(session: CursorLoginSession): Promise<void> {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : String(error);
-    if (/fetch|network|timeout|ECONN|ENOTFOUND|429|5\d\d/i.test(message)) {
+    const retryStatus = /^Poll failed: (429|5\d\d)$/.exec(message);
+    if (retryStatus || /fetch|network|timeout|ECONN|ENOTFOUND/i.test(message)) {
+      session.lastPoll = retryStatus ? `HTTP ${retryStatus[1]}` : "network error or timeout";
       schedulePoll(session, POLL_INTERVAL_MS + 1_000);
       return;
     }

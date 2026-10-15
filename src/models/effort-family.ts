@@ -58,6 +58,10 @@ export function groupEffortFamilies(models: readonly CursorModel[]): CursorModel
       (entry) => !consumed.has(entry.model.id),
     );
     const family = !consumed.has(familyId) ? byId.get(familyId) : undefined;
+    // OpenCode has one context limit per model, shared by its effort variants.
+    const base = family ?? entries[0]?.model;
+    if (base && entries.some(({ model }) => model.contextWindow !== base.contextWindow ||
+      model.contextWindowIsFallback !== base.contextWindowIsFallback)) continue;
     const thinking = entries.filter((entry) => entry.alias.thinking);
     const plain = entries.filter((entry) => !entry.alias.thinking);
     const built =
@@ -145,6 +149,7 @@ function groupThinkingFamily(
       name: stripThinkingLabel(family?.name ?? familyName(plain, thinking)),
       reasoning: true,
       contextWindow: family?.contextWindow ?? members[0]!.contextWindow,
+      contextWindowIsFallback: (family ?? members[0]!).contextWindowIsFallback,
       maxTokens: family?.maxTokens ?? members[0]!.maxTokens,
       defaultSelection,
       variants,
@@ -182,6 +187,7 @@ function groupPlainFamily(
       name: family?.name ?? familyName(plain, []),
       reasoning: true,
       contextWindow: family?.contextWindow ?? defaultModel.contextWindow,
+      contextWindowIsFallback: defaultModel.contextWindowIsFallback,
       maxTokens: family?.maxTokens ?? defaultModel.maxTokens,
       defaultSelection: family?.defaultSelection ?? defaultModel.defaultSelection,
       variants,

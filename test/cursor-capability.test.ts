@@ -148,6 +148,7 @@ test("Node H2 transports the allowlist and correlates actual data-dependent tool
   const seen: string[] = [];
   const server = await backend((stream, headers) => {
     assert.equal(headers["x-cursor-agent-allowed-tools"], undefined);
+    assert.equal(headers["connect-accept-encoding"], "gzip");
     stream.respond({ ":status": 200, "connect-content-encoding": "gzip" });
     let pending = Buffer.alloc(0);
     const exec = (name: string, value: string) => messageFrame({ case: "execServerMessage", value: create(p.ExecServerMessageSchema, {

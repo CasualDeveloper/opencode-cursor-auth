@@ -4,7 +4,7 @@ import {
   CURSOR_OAUTH_METHOD_ID,
   registerCursorIntegration,
 } from "../src/opencode/integration";
-import { resetPendingCursorLogin } from "../src/opencode/auth-login";
+import { resetPendingCursorLogin, startCursorBrowserLogin } from "../src/opencode/auth-login";
 import { makeJwt } from "./helpers/jwt";
 
 describe("OpenCode V2 Cursor integration", () => {
@@ -127,6 +127,40 @@ describe("OpenCode V2 Cursor integration", () => {
       expect(second.url).not.toBe(first.url);
       resetPendingCursorLogin();
       await cancelled;
+    } finally {
+      resetPendingCursorLogin();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("rejects an HTTP 200 login response without a Cursor token pair", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      Response.json({ accessToken: "private-placeholder" })) as typeof fetch;
+    try {
+      const session = await startCursorBrowserLogin();
+      await expect(session.result).rejects.toThrow(
+        /^Cursor login poll returned HTTP 200 without a Cursor access and refresh token pair$/,
+      );
+    } finally {
+      resetPendingCursorLogin();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("a login timeout reports that the poll endpoint returned no credential", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let session: Awaited<ReturnType<typeof startCursorBrowserLogin>>;
+      globalThis.fetch = (async () => {
+        // Skip the 15-minute deadline without changing the process-wide clock.
+        session.startedAt -= 16 * 60_000;
+        return new Response(null, { status: 404 });
+      }) as typeof fetch;
+      session = await startCursorBrowserLogin();
+      await expect(session.result).rejects.toThrow(
+        "Cursor authentication polling timeout (last poll: HTTP 404, no credential available)",
+      );
     } finally {
       resetPendingCursorLogin();
       globalThis.fetch = originalFetch;

@@ -17,15 +17,29 @@ export function publishCursorCatalog(
   const usableWires = usableModelIds(usableRaw);
   applyUsableWireIds(available, usableWires);
   const byId = new Map(available.map((model) => [model.id, model]));
+  const availableWires = new Set(available.flatMap(wireIds));
 
   for (const model of usable) {
     const existing = byId.get(model.id);
     if (existing) {
+      // Usable-only aliases carry no window or structural parameters. Don't
+      // attach one to a model that promises a specific live context size.
       for (const [key, selection] of Object.entries(model.variants)) {
-        if (!existing.variants[key]) existing.variants[key] = selection;
+        if (existing.variants[key]) continue;
+        if (existing.contextWindowIsFallback) {
+          existing.variants[key] = selection;
+        } else if (!availableWires.has(selection.publicId) && !byId.has(selection.publicId)) {
+          byId.set(selection.publicId, {
+            ...model, id: selection.publicId, name: selection.displayName,
+            defaultSelection: selection, variants: {},
+          });
+        }
       }
       continue;
     }
+    // A usable family sharing a wire ID with an AvailableModels family under
+    // another id is a legacy alias of it, not a separate model.
+    if (wireIds(model).some((id) => availableWires.has(id))) continue;
     byId.set(model.id, model);
   }
 

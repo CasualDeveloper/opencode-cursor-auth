@@ -142,6 +142,29 @@ adapter does not guarantee simultaneous launch of an entire upstream group.
 
 ## Usage, caching, and bounds
 
+The adapter recognizes three new interaction updates in the published
+[@cursor/sdk 1.4.1 wire schema](https://registry.npmjs.org/@cursor/sdk/-/sdk-1.4.1.tgz):
+thinking notes, voice utterances, and per-model-call usage. None becomes
+assistant output. They can arrive after `turnEnded` while the worker waits for
+the Connect end frame. The worker advertises gzip support for response frames;
+a truncated frame still fails the Run. The workers now send
+`x-cursor-client-version: cli-2026.11.17-f532c45`.
+
+With an access token obtained through Cursor's User API key exchange, both
+`cli-2026.01.09-231024f` and `cli-2026.11.17-f532c45` returned a complete
+28-model catalog. In one short Composer 2.5 Run per header, the model called
+the synthetic tool once, returned its exact random value, and finished with
+a clean Connect end frame. The November header also passed the same check
+using a fresh browser OAuth login from the plugin source: the poll went from
+HTTP 404 to 200, the catalog contained 28 models, and the tool Run finished
+in 6.9 seconds. These short Runs did not exercise the long-session checkpoint
+failure or renewal of an expired credential.
+
+SDK 1.4.1 native writes can require plan mode, workspace confinement, or
+refusal if the file changed since Cursor read it. OpenCode's plain write tool
+cannot enforce those conditions, so the adapter returns a rejected write
+result without dispatching the tool.
+
 The V2-only `TurnEndedUpdate` projection in `src/proto/agent-v2-usage.proto` uses
 the optional int64 fields verified in the static
 [@cursor/sdk 1.0.31 archive](https://registry.npmjs.org/@cursor/sdk/-/sdk-1.0.31.tgz).
@@ -159,8 +182,10 @@ from the latest checkpoint occupancy (`tokenDetails.usedTokens`): a final
 checkpoint equal to terminal input plus output uses terminal input; a
 post-generation checkpoint without matching totals subtracts that step's
 streamed output; and a pre-generation checkpoint remains input occupancy.
-The step's output is its summed `tokenDelta` progress. Cursor exposes neither
-per-call input nor a per-call cache split, so the derived input is reported as
+The step's output is its summed `tokenDelta` progress. SDK 1.4.1's optional
+`model_call_completed` describes an upstream model call, which need not align
+with an OpenCode tool step. The adapter does not request these events or add
+their counts to terminal usage. The derived input is reported as
 uncached to keep OpenCode's context meter and compaction tracking the
 conversation size. A checkpoint without token details, or with zero, does not
 erase known occupancy. Reasoning and cache fields remain unknown. A step that

@@ -15,6 +15,7 @@ interface CursorModelDetails {
   displayModelId?: string;
   aliases: string[];
   thinkingDetails?: unknown;
+  maxMode: boolean;
 }
 
 export function normalizeCursorModels(
@@ -42,8 +43,9 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
     name: pickDisplayName(details, id),
     reasoning: Boolean(details.thinkingDetails),
     contextWindow: DEFAULT_CONTEXT_WINDOW,
+    contextWindowIsFallback: true,
     maxTokens: DEFAULT_MAX_TOKENS,
-    defaultSelection: literalCursorModelSelection(id),
+    defaultSelection: { ...literalCursorModelSelection(id), maxMode: details.maxMode },
     variants: {},
   };
 }
@@ -69,6 +71,7 @@ function parseCursorModelDetails(
         )
       : [],
     thinkingDetails: record.thinkingDetails,
+    maxMode: record.maxMode === true,
   };
 }
 
